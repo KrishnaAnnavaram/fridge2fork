@@ -9,7 +9,7 @@
 ![Retrieval](https://img.shields.io/badge/Retrieval-hybrid-1F3864?style=for-the-badge)
 ![Embeddings](https://img.shields.io/badge/Embeddings-PPMI--SVD_%7C_Word2Vec-2E5FD9?style=for-the-badge)
 ![Steps](https://img.shields.io/badge/Steps-from_the_data-6E86E8?style=for-the-badge)
-![Tests](https://img.shields.io/badge/Tests-45_passing-3DA35B?style=for-the-badge)
+![Tests](https://img.shields.io/badge/Tests-44_passing-3DA35B?style=for-the-badge)
 ![Offline demo](https://img.shields.io/badge/Offline_demo-Yes-F5C542?style=for-the-badge)
 ![License](https://img.shields.io/badge/License-MIT-A0399B?style=for-the-badge)
 
@@ -101,7 +101,7 @@ fridge2fork gives each of these questions its own component. An offline evaluati
 | Providers | Optional: an OpenAI-compatible chat model for explanations |
 | Offline mode | Everything. The default embedder (PPMI + SVD), the NumPy index and the template explainer need no key and no network |
 | Safety | Steps come from the data. A model reply with a new number or a step list is refused |
-| Tests | **46** tests: 45 pass locally (1 skips without `gensim`). In CI, 44 pass and 2 skip (`faiss`, `gensim`) |
+| Tests | **44** unit tests pass in CI (`pytest`), 2 skip without the `faiss` and `w2v` extras. With the `faiss` extra: 45 pass, 1 skips |
 
 ```mermaid
 flowchart LR
@@ -151,7 +151,7 @@ fridge2fork/
 ├── data/README.md             # source, terms, columns (no data files)
 ├── docs/ste-style-guide.md    # writing rules and project vocabulary
 ├── src/fridge2fork/           # the package (one module per component, see 2.1)
-├── tests/                     # 46 offline tests on synthetic and hand-made recipes
+├── tests/                     # 46 offline tests on synthetic and hand-made recipes (2 need extras)
 ├── .env.example               # variable names only
 ├── pyproject.toml             # dependencies, extras, the fridge2fork command
 └── LICENSE                    # MIT
@@ -456,8 +456,8 @@ The settings come from the environment and from a local `.env` file. An environm
 
 | Validation | Result | Command |
 |---|---|---|
-| Unit tests, local (with `faiss`, without `gensim`) | **45 passed, 1 skipped** | `pytest -q` |
-| Unit tests in CI (no optional extras) | **44 passed, 2 skipped** | `pytest -q` |
+| Unit tests (CI installs only `.[dev]`) | **44 passed, 2 skipped** (the `faiss` and `gensim` tests) | `pytest -q` |
+| Unit tests with the `faiss` extra | **45 passed, 1 skipped** (the `gensim` test) | `pytest -q` |
 | Offline evaluation on synthetic data | See the table below | `fridge2fork demo` |
 
 The demo uses 1,500 synthetic recipes (seed 42, 74 canonical ingredients). The evaluation hides 2 ingredients of 300 held-out recipes. The embedder is fit on the other 1,200 recipes. **These numbers are synthetic.** They show that the pipeline works. They do not show the quality on Food.com data.
