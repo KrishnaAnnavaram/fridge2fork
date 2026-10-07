@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fridge2fork"
+version = "0.1.0"
+description = "What can I cook? Ingredient-based recipe search with Word2Vec, FAISS and GPT"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Krishna Annavaram" }]
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.26", "pandas>=2.1", "scipy>=1.11", "scikit-learn>=1.4"]
+
+[project.optional-dependencies]
+w2v = ["gensim>=4.3"]
+faiss = ["faiss-cpu>=1.7"]
+llm = ["openai>=1.30"]
+ui = ["streamlit>=1.32"]
+all = ["fridge2fork[w2v,faiss,llm,ui]"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+fridge2fork = "fridge2fork.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
