@@ -66,6 +66,7 @@ This README is the **one location that explains all of fridge2fork**. It gives t
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one query](#42-the-life-cycle-of-one-query)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 🔵 [Ingredient normalisation](#5-ingredient-normalisation)
 6. 🟢 [Embeddings and indexes](#6-embeddings-and-indexes)
 7. 🟣 [Grounded explanations](#7-grounded-explanations)
@@ -130,6 +131,50 @@ flowchart LR
 | Streamlit app | `src/fridge2fork/app.py` | Web page with a cached index (extra `ui`) |
 | CLI | `src/fridge2fork/cli.py` | The `fridge2fork` command |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    subgraph ENTRY["Entry points"]
+        CLI["cli.py<br/>fridge2fork command"]
+        APP["app.py<br/>Streamlit, extra ui"]
+        CFG["config.py<br/>Settings.from_env"]
+    end
+    subgraph DATAIN["Data in"]
+        SYN["synthetic.py<br/>generate"]
+        DATA["data.py<br/>load_recipes, prepare"]
+        NORM["normalize.py<br/>canonical, match_query"]
+    end
+    subgraph SEARCH["Search and rank"]
+        REC["recommender.py<br/>Recommender"]
+        EMB["embed.py<br/>SVDEmbedder, Word2VecEmbedder"]
+        IDX["index.py<br/>NumpyIndex, FaissIndex, InvertedIndex"]
+        RANK["rank.py<br/>score_recipe, allergens_of"]
+    end
+    subgraph OUTPUTS["Explain and measure"]
+        EXP["explain.py<br/>template, grounded, check_reply"]
+        LLM["llm.py<br/>OpenAIChat, ScriptedLLM"]
+        EVAL["evaluate.py<br/>evaluate, VARIANTS"]
+    end
+
+    CLI --> CFG
+    CLI --> SYN
+    CLI --> DATA
+    CLI --> REC
+    CLI --> EXP
+    CLI --> EVAL
+    CLI -- "ui" --> APP
+    APP --> REC
+    APP --> EXP
+    DATA --> NORM
+    REC --> NORM
+    REC --> EMB
+    REC --> IDX
+    REC --> RANK
+    EXP --> LLM
+    EVAL --> REC
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -164,6 +209,18 @@ fridge2fork/
 ### 3.1 One normaliser for data and query
 `normalize.canonical` removes quantities, units and descriptors, makes plurals singular and applies a synonym table. The data loader and the query matcher both use it. Thus matched and missing lists compare the same names.
 
+```mermaid
+flowchart LR
+    RAW[/"Recipe file:<br/>raw ingredient strings"/] --> PREP["data.prepare:<br/>canonical_list"]
+    USER[/"User text"/] --> MQ["normalize.match_query"]
+    PREP --> CAN["normalize.canonical"]
+    MQ --> CAN
+    CAN --> RN[/"Recipe ingredients:<br/>canonical names"/]
+    CAN --> QN[/"Known query items:<br/>canonical names"/]
+    RN --> SC["rank.score_recipe:<br/>matched and missing lists"]
+    QN --> SC
+```
+
 ### 3.2 No zero vector
 If no query ingredient has an embedding, the query vector is `None` and the dense retriever does not run. A recipe with no embedded ingredient is never a dense hit. The result tells the user which ingredients were unknown or corrected.
 
@@ -189,28 +246,63 @@ The chat model reads `OPENAI_API_KEY` from the environment or from `.env`. The a
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    subgraph build["fridge2fork build"]
-        RAW["recipe file"] --> NORM["normalise ingredients"]
-        NORM --> EMB["fit embedder (PPMI + SVD or Word2Vec)"]
-        NORM --> INV["inverted ingredient index"]
-        EMB --> VEC["recipe vectors (unit length)"]
-        VEC --> SAVE["save index and manifest"]
-        INV --> SAVE
-    end
-    subgraph query["fridge2fork recommend"]
-        Q["user ingredients"] --> QN["normalise, correct, report unknown"]
-        QN --> C1["overlap candidates"]
-        QN --> C2["dense candidates (if a query vector exists)"]
-        C1 --> RANK["absolute score, filters"]
-        C2 --> RANK
-        RANK --> EXP["template or grounded explanation"]
-    end
-    SAVE --> C1
-    SAVE --> C2
+flowchart TD
+    SRC{"Recipe source"} -- "fridge2fork synth" --> SYN["synthetic.generate"]
+    SRC -- "Food.com" --> FILE[/"data/recipes.csv<br/>CSV, JSON Lines or Parquet"/]
+    SYN --> LOAD["load_recipes, prepare:<br/>canonical names, remove empty<br/>and duplicate recipes"]
+    FILE --> LOAD
+    LOAD --> EMB["make_embedder, fit:<br/>PPMI + SVD or Word2Vec"]
+    EMB --> SAVE["Recommender.save"]
+    SAVE --> STORE[("artifacts/index/<br/>recipes.pkl, ingredient vectors,<br/>vocabulary, manifest")]
+    STORE --> LOADI["Recommender.load: build InvertedIndex,<br/>recipe vectors, vector index"]
+    Q[/"User ingredients<br/>CLI or Streamlit"/] --> MQ["match_query:<br/>normalise, correct, report unknown"]
+    LOADI --> MQ
+    MQ --> KN{"Known ingredient?"}
+    KN -- "no" --> NONE[/"Warning:<br/>no recommendation"/]
+    KN -- "yes" --> C1["Overlap candidates<br/>FRIDGE2FORK_OVERLAP_K"]
+    KN -- "yes, with a query vector" --> C2["Dense candidates<br/>FRIDGE2FORK_DENSE_K"]
+    C1 --> RANK["Filters, score_recipe, sort"]
+    C2 --> RANK
+    RANK --> EXQ{"--explain?"}
+    EXQ -- "no" --> OUT[/"Ranked recipes, matched,<br/>missing, allergen warnings"/]
+    EXQ -- "yes" --> EXP["Template or grounded explanation<br/>with the real steps"]
+    EXP --> OUT
+    OUT --> HUMAN{{"HUMAN<br/>user reads the allergen warnings<br/>and the food labels"}}
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
 ```
 
 ### 4.2 The life cycle of one query
+
+```mermaid
+stateDiagram-v2
+    state "User text" as Text
+    state "Items parsed" as Parsed
+    state "Items matched to the vocabulary" as Matched
+    state "Query vector made" as Vector
+    state "Overlap only" as OverlapOnly
+    state "Candidate set" as Candidates
+    state "Candidates scored and filtered" as Scored
+    state "Top k recommendations" as Shown
+    state "Explained with the real steps" as Explained
+    state "No recommendation" as Empty
+    [*] --> Text
+    Text --> Parsed: parse_list on comma, semicolon, new line
+    Parsed --> Matched: canonical, spelling correction 0.85
+    Matched --> Empty: no known item
+    Matched --> Vector: embedder.vector
+    Matched --> OverlapOnly: no known item has an embedding
+    Vector --> Candidates: overlap top UNION dense top
+    OverlapOnly --> Candidates: overlap top
+    Candidates --> Scored: filters, score_recipe
+    Scored --> Empty: no recipe passes the filters
+    Scored --> Shown: sort by score, missing, recipe_id
+    Shown --> Explained: --explain
+    Shown --> [*]
+    Explained --> [*]
+    Empty --> [*]
+```
 
 1. Split the user text on commas, semicolons or new lines.
 2. Normalise each item to a canonical name.
@@ -222,11 +314,62 @@ flowchart TB
 8. Sort by score, then by the missing count, then by recipe id.
 9. Show the top k recipes with the template or the grounded explanation.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant CLI as fridge2fork CLI
+    participant REC as Recommender
+    participant NORM as normalize.py
+    participant INV as InvertedIndex
+    participant VI as Vector index
+    participant RANK as rank.py
+    participant EXP as explain.py
+    participant LLM as Chat model
+
+    U->>CLI: fridge2fork recommend "tomatoes, pasta" --explain
+    CLI->>CLI: Settings.from_env
+    CLI->>REC: Recommender.load(index_dir)
+    CLI->>REC: recommend(text, k, max_missing, exclude, vegetarian)
+    REC->>NORM: match_query(text, vocabulary)
+    NORM-->>REC: known, corrections, unknown
+    REC->>INV: top(known, overlap_k)
+    INV-->>REC: overlap candidates
+    REC->>VI: search(query vector, dense_k)
+    VI-->>REC: dense candidates and cosines
+    REC->>RANK: allergens_of, is_vegetarian, score_recipe
+    RANK-->>REC: Features for each candidate
+    REC-->>CLI: Result with warnings and recommendations
+    alt FRIDGE2FORK_LLM is openai
+        CLI->>EXP: grounded_explanation(rec, known, llm)
+        EXP->>LLM: complete(system rule, recipe data)
+        LLM-->>EXP: reply
+        EXP->>EXP: check_reply
+    else FRIDGE2FORK_LLM is none
+        CLI->>EXP: template_explanation(rec)
+    end
+    EXP-->>CLI: Explanation with the real steps
+    CLI-->>U: ranked recipes, notes and explanations
+```
+
 ---
 
 ## 5. Ingredient normalisation
 
 **Purpose.** Give one canonical name to each ingredient in the data and in the query.
+
+```mermaid
+flowchart LR
+    IN[/"Raw ingredient string"/] --> LOW["Lower case"]
+    LOW --> BR["Remove text in brackets,<br/>keep text before the first comma"]
+    BR --> CH["Remove other characters"]
+    CH --> DROP["Drop numbers, fractions,<br/>UNITS and DESCRIPTORS"]
+    DROP --> SING["singular: IRREGULAR table,<br/>then -ies, -es, -s rules"]
+    SING --> SYN["SYNONYMS lookup"]
+    SYN --> OUT[/"Canonical name,<br/>or empty"/]
+```
 
 | Input | Output |
 |---|---|
@@ -246,6 +389,49 @@ flowchart TB
 - Duplicate names in one recipe count once.
 - A recipe with no ingredient after normalisation is removed. A recipe with the same name and ingredients as an earlier one is removed.
 
+The data loader (`data.load_recipes`) applies the normaliser to each recipe of the file.
+
+```mermaid
+flowchart TD
+    IN[/"Recipe file"/] --> EX{"File exists?"}
+    EX -- "no" --> ERR1[/"FileNotFoundError"/]
+    EX -- "yes" --> FMT{"Suffix"}
+    FMT -- ".parquet" --> RP["read_parquet"]
+    FMT -- ".jsonl or .json" --> RJ["read_json"]
+    FMT -- "other" --> RC["read_csv"]
+    RP --> REQ{"name and ingredients<br/>columns present?"}
+    RJ --> REQ
+    RC --> REQ
+    REQ -- "no" --> ERR2[/"RecipeSchemaError"/]
+    REQ -- "yes" --> PARSE["parse_list on ingredients and steps,<br/>canonical_list on ingredients"]
+    PARSE --> EMPTY["Remove recipes with<br/>no ingredient"]
+    EMPTY --> DUP["Remove duplicates of<br/>name and ingredients"]
+    DUP --> IDS{"Duplicate recipe ids?"}
+    IDS -- "yes" --> ROWN["Use row numbers,<br/>add a warning"]
+    IDS -- "no" --> LEFT{"Any recipe left?"}
+    ROWN --> LEFT
+    LEFT -- "no" --> ERR2
+    LEFT -- "yes" --> OUT[/"Clean recipes and LoadReport"/]
+```
+
+The query matcher (`normalize.match_query`) maps each user item to the vocabulary of the recipe data.
+
+```mermaid
+flowchart LR
+    IN[/"User text"/] --> PL["parse_list"]
+    PL --> CAN["canonical"]
+    CAN --> E{"Empty?"}
+    E -- "yes" --> SKIP["Skip the item"]
+    E -- "no" --> V{"In the vocabulary?"}
+    V -- "yes" --> KNOWN["Add to known"]
+    V -- "no" --> CL{"Close match,<br/>similarity 0.85 or more?"}
+    CL -- "yes" --> CORR["Add to known,<br/>record the correction"]
+    CL -- "no" --> UNK["Add to unknown"]
+    KNOWN --> OUT[/"QueryMatch: known,<br/>corrections, unknown"/]
+    CORR --> OUT
+    UNK --> OUT
+```
+
 | Raw text | Canonical name |
 |---|---|
 | `2 large Tomatoes, chopped` | `tomato` |
@@ -259,6 +445,36 @@ flowchart TB
 ## 6. Embeddings and indexes
 
 **Purpose.** Find recipes with similar ingredient mixes (dense) and recipes with many shared ingredients (overlap).
+
+```mermaid
+flowchart TD
+    IN[/"Canonical ingredient lists<br/>of the recipes"/] --> VOC["_vocab: keep names in<br/>FRIDGE2FORK_MIN_COUNT recipes or more"]
+    VOC --> TWO{"2 or more names?"}
+    TWO -- "no" --> ERR[/"ValueError: lower<br/>FRIDGE2FORK_MIN_COUNT"/]
+    TWO -- "yes" --> KIND{"FRIDGE2FORK_EMBEDDER"}
+    KIND -- "svd" --> CO["Co-occurrence counts:<br/>X transposed times X"]
+    CO --> PMI["PMI of each pair,<br/>keep values above 0"]
+    PMI --> SVD["TruncatedSVD,<br/>FRIDGE2FORK_DIM, seeded"]
+    KIND -- "word2vec" --> W2V["gensim Word2Vec: skip-gram,<br/>window 10, 1 worker, seeded"]
+    SVD --> UNIT["Unit-length<br/>ingredient vectors"]
+    W2V --> UNIT
+    UNIT --> OUT[/"Embedder: vocab and vectors"/]
+```
+
+When the `Recommender` starts (after `build` or `load`), it makes the recipe vectors and the two indexes.
+
+```mermaid
+flowchart LR
+    REC[/"Recipes and embedder"/] --> RM["recipe_matrix: mean of known<br/>ingredient vectors, unit length"]
+    RM --> OK{"Recipe has a<br/>known ingredient?"}
+    OK -- "no" --> NV["valid = false,<br/>never a dense hit"]
+    OK -- "yes" --> VV["valid = true"]
+    VV --> VI{"FRIDGE2FORK_VECTOR_INDEX"}
+    NV --> VI
+    VI -- "numpy" --> NP["NumpyIndex:<br/>exact cosine"]
+    VI -- "faiss" --> FA["FaissIndex:<br/>IndexFlatIP, valid rows only"]
+    REC --> INV["InvertedIndex: sparse<br/>recipe x ingredient matrix,<br/>all canonical names"]
+```
 
 | Input | Output |
 |---|---|
@@ -281,11 +497,49 @@ flowchart TB
 - The inverted index uses all ingredients, also the ingredients below `FRIDGE2FORK_MIN_COUNT`.
 - `manifest.json` records the embedder, the dimension, the seed, the counts and the SHA-256 value of the recipe file.
 
+```mermaid
+flowchart TD
+    subgraph SAVE["Recommender.save"]
+        S1["recipes.pkl"] --> S2["ingredient_vectors.npy"]
+        S2 --> S3["vocabulary.json"]
+        S3 --> S4["manifest.json: format_version,<br/>embedder, dim, seed, counts,<br/>source_sha256"]
+    end
+    S4 --> STORE[("Index folder<br/>FRIDGE2FORK_INDEX_DIR")]
+    STORE --> M{"manifest.json present?"}
+    subgraph LOAD["Recommender.load"]
+        M -- "no" --> ERR1[/"FileNotFoundError:<br/>run fridge2fork build"/]
+        M -- "yes" --> FV{"format_version is 1?"}
+        FV -- "no" --> ERR2[/"ValueError:<br/>build again"/]
+        FV -- "yes" --> L1["make_embedder, set vocab<br/>and vectors from the files"]
+        L1 --> L2["Read recipes.pkl"]
+        L2 --> L3["New Recommender:<br/>indexes built again"]
+    end
+```
+
 ---
 
 ## 7. Grounded explanations
 
 **Purpose.** Tell the user why a recipe fits and what to use instead of a missing item, with the real steps.
+
+```mermaid
+flowchart TD
+    IN[/"Recommendation and<br/>known user ingredients"/] --> SEL{"FRIDGE2FORK_LLM"}
+    SEL -- "none" --> TPL["template_explanation"]
+    SEL -- "openai" --> KEY{"OPENAI_API_KEY set?"}
+    KEY -- "no" --> ERR[/"error: set OPENAI_API_KEY,<br/>the CLI returns 2"/]
+    KEY -- "yes" --> PR["Prompt: name, raw ingredients,<br/>real steps, matched, missing,<br/>known substitutions"]
+    PR --> CALL["OpenAIChat.complete:<br/>SYSTEM rule, temperature 0"]
+    CALL --> EXC{"Model error?"}
+    EXC -- "yes" --> FB1["Template, note:<br/>model error and its type"]
+    EXC -- "no" --> CHK{"check_reply: empty,<br/>new number or 2 numbered<br/>step lines?"}
+    CHK -- "yes" --> FB2["Template, note:<br/>model reply refused and the reason"]
+    CHK -- "no" --> OK["Reply + the real steps,<br/>source is the model name"]
+    TPL --> OUT[/"Explanation: text,<br/>source, note"/]
+    FB1 --> OUT
+    FB2 --> OUT
+    OK --> OUT
+```
 
 | Input | Output |
 |---|---|
@@ -304,9 +558,26 @@ flowchart TB
 | Empty reply | Refused |
 | A number that is not in the recipe or in the substitution table | Refused |
 | Two or more numbered step lines | Refused |
-| Model error (timeout, network, key) | Template, with the error type in the note |
+| Model error (timeout, network, rejected key) | Template, with the error type in the note |
+
+If `FRIDGE2FORK_LLM=openai` and `OPENAI_API_KEY` is not set, the command stops with an error before it shows a recipe.
 
 The template explanation gives the coverage, the matched and missing lists, substitutions from a fixed table, allergen warnings and the real steps.
+
+```mermaid
+flowchart LR
+    IN[/"Recommendation"/] --> L1["Name, matched count,<br/>coverage with pantry items"]
+    L1 --> L2["Matched list"]
+    L2 --> MS{"Missing items?"}
+    MS -- "yes" --> L3["Missing list and<br/>SUBSTITUTES for each item"]
+    MS -- "no" --> L4["Nothing is missing"]
+    L3 --> AL{"Allergen groups?"}
+    L4 --> AL
+    AL -- "yes" --> L5["Allergen warning,<br/>keyword check"]
+    AL -- "no" --> ST["Steps from the recipe data,<br/>or a note that there are none"]
+    L5 --> ST
+    ST --> OUT[/"Explanation, source template"/]
+```
 
 ---
 
@@ -314,12 +585,51 @@ The template explanation gives the coverage, the matched and missing lists, subs
 
 score = 0.5 × coverage + 0.25 × use + 0.25 × (cosine + 1) / 2 − 0.1 × min(missing, 10) / 10
 
+```mermaid
+flowchart TD
+    IN[/"One candidate recipe"/] --> EXI{"In exclude_ids?<br/>evaluation only"}
+    EXI -- "yes" --> DROP[/"Removed"/]
+    EXI -- "no" --> ALG{"allergens_of matches<br/>an --exclude group?"}
+    ALG -- "yes" --> DROP
+    ALG -- "no" --> VEG{"--vegetarian and<br/>meat, fish or shellfish?"}
+    VEG -- "yes" --> DROP
+    VEG -- "no" --> DEN{"Dense hit?"}
+    DEN -- "yes" --> COS["Cosine from the<br/>vector index"]
+    DEN -- "no, both vectors exist" --> DOT["Cosine = recipe vector<br/>dot query vector"]
+    DEN -- "no vector" --> NOC["Cosine absent, counts as 0"]
+    COS --> SC["score_recipe: coverage, use,<br/>cosine, missing"]
+    DOT --> SC
+    NOC --> SC
+    SC --> MM{"More missing than<br/>max_missing?"}
+    MM -- "yes" --> DROP
+    MM -- "no" --> KEEP["Keep"]
+    KEEP --> SORT["Sort: score down, then missing<br/>count, then recipe_id"]
+    SORT --> OUT[/"Top k recommendations"/]
+```
+
 | Feature | Meaning | Weight |
 |---|---|---|
 | coverage | Share of the recipe ingredients that the user has (pantry items count as owned) | 0.5 |
 | use | Share of the user ingredients that the recipe uses | 0.25 |
 | cosine | Cosine of the query vector and the recipe vector, 0 if one of them is absent | 0.25 |
 | missing | Number of recipe ingredients that the user does not have | −0.1, up to 10 items |
+
+```mermaid
+flowchart LR
+    R[/"Recipe ingredients"/] --> HAVE["have = user items<br/>+ PANTRY if assume_pantry"]
+    U[/"Known user items"/] --> HAVE
+    HAVE --> MISS["missing = recipe items<br/>not in have"]
+    U --> MAT["matched = recipe items<br/>in the user items"]
+    R --> MAT
+    MISS --> COV["coverage = 1 - missing / recipe size"]
+    MAT --> USE["use = matched / user items"]
+    C[/"Cosine or absent"/] --> D01["(cosine + 1) / 2,<br/>0 if absent"]
+    COV --> S["score = 0.5 coverage + 0.25 use<br/>+ 0.25 d01 - 0.1 min(missing, 10) / 10"]
+    USE --> S
+    D01 --> S
+    MISS --> S
+    S --> OUT[/"Features: matched, missing,<br/>coverage, use, dense, score"/]
+```
 
 | Filter | Setting | Effect |
 |---|---|---|
@@ -410,6 +720,44 @@ pytest -q
 | `fridge2fork ui` | Starts the Streamlit app on the saved index |
 | `fridge2fork demo` | Runs `synth`, `build`, one query and `evaluate` |
 
+The diagram shows the order of the commands and the files that connect them.
+
+```mermaid
+flowchart LR
+    INS["pip install -e .[dev]"] --> SYN["fridge2fork synth"]
+    SYN --> CSV[("data/synthetic_recipes.csv")]
+    FOOD[("data/recipes.csv<br/>Food.com")] --> BUILD["fridge2fork build"]
+    CSV --> BUILD
+    BUILD --> IDX[("artifacts/index/")]
+    IDX --> RECO["fridge2fork recommend"]
+    IDX --> UI["fridge2fork ui"]
+    CSV --> EVAL["fridge2fork evaluate<br/>builds its own index in memory"]
+    FOOD --> EVAL
+    INS --> DEMO["fridge2fork demo"]
+    DEMO --> DOUT[("artifacts/demo/<br/>recipes, index, evaluation.csv")]
+```
+
+`fridge2fork ui` starts the Streamlit app (`app.py`). The app loads the index once per server process.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant ST as Streamlit app
+    participant REC as Recommender
+    participant EXP as explain.py
+
+    U->>ST: open the page
+    ST->>REC: _load(index_dir), cached with st.cache_resource
+    U->>ST: ingredients, recipe count, maximum missing, vegetarian, allergens
+    ST->>REC: recommend(text, k, max_missing, exclude_allergens, vegetarian)
+    REC-->>ST: Result
+    ST-->>U: one warning box for each warning
+    ST->>EXP: grounded_explanation or template_explanation
+    EXP-->>ST: Explanation
+    ST-->>U: one expander for each recipe
+```
+
 ### 10.4 Environment variables
 
 | Variable | Used by | Meaning |
@@ -433,6 +781,17 @@ pytest -q
 | `OPENAI_API_KEY` | explanations | API key (credential) |
 
 The settings come from the environment and from a local `.env` file. An environment variable wins over the `.env` file. Credentials are only in a local `.env` file. Git ignores this file. Do not print or commit credentials.
+
+```mermaid
+flowchart LR
+    ENV[/".env file"/] --> RD["read_dotenv:<br/>skips empty values"]
+    PENV[/"Process environment"/] --> MERGE["Merge: the environment<br/>wins over .env"]
+    RD --> MERGE
+    MERGE --> FE["Settings.from_env"]
+    FE --> CHK{"__post_init__ checks:<br/>embedder, vector index, llm,<br/>dim 2 to 512, k values, max_missing?"}
+    CHK -- "valid" --> SET[/"Settings"/]
+    CHK -- "not valid" --> ERR[/"ValueError: the CLI prints<br/>error: and returns 2"/]
+```
 
 ---
 
@@ -459,6 +818,20 @@ The settings come from the environment and from a local `.env` file. An environm
 | Unit tests (CI installs only `.[dev]`) | **44 passed, 2 skipped** (the `faiss` and `gensim` tests) | `pytest -q` |
 | Unit tests with the `faiss` extra | **45 passed, 1 skipped** (the `gensim` test) | `pytest -q` |
 | Offline evaluation on synthetic data | See the table below | `fridge2fork demo` |
+
+The offline evaluation (`evaluate.py`) hides ingredients of known recipes and searches with the rest.
+
+```mermaid
+flowchart TD
+    IN[/"Clean recipes, --queries,<br/>--hide"/] --> POOL{"Recipes with hide + 2<br/>ingredients or more?"}
+    POOL -- "no" --> ERR[/"ValueError"/]
+    POOL -- "yes" --> PICK["make_queries: seeded sample,<br/>hide random ingredients"]
+    PICK --> FIT["Recommender.build: embedder fit<br/>on the other recipes, index holds all"]
+    FIT --> VAR["For each variant:<br/>dense, overlap, hybrid"]
+    VAR --> Q["recommend the visible ingredients,<br/>k = 50, no max_missing"]
+    Q --> RANK["Rank of the held-out recipe,<br/>or not found"]
+    RANK --> OUT[/"recall@1, recall@5, recall@10,<br/>MRR@50 for each variant"/]
+```
 
 The demo uses 1,500 synthetic recipes (seed 42, 74 canonical ingredients). The evaluation hides 2 ingredients of 300 held-out recipes. The embedder is fit on the other 1,200 recipes. **These numbers are synthetic.** They show that the pipeline works. They do not show the quality on Food.com data.
 
